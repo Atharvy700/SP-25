@@ -1,79 +1,173 @@
-#!/usr/bin/env python3
-# qwen_finetune.py
 import argparse
 import json
 import os
-import numpy as np
-import torch
-from torch.utils.data import Dataset
+import random
+from typing import List, Dict, Any
 
+import torch
+from datasets import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    Trainer,
     TrainingArguments,
+    Trainer,
 )
 
-def load_json_list(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+from peft import LoraConfig, get_peft_model, TaskType
 
-def build_prompt(example_text: str) -> str:
-    return (
-        "You are a careful reasoning assistant.\n"
-        "Task: Answer the final question with exactly one word: yes or no.\n\n"
-        f"{example_text}\n\n"
-        "Answer (yes/no):"
+
+# ----------------------------
+# Utils: load json or jsonl
+# ----------------------------
+def load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
+    if path.endswith(".jsonl"):
+        out = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
+    elif path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        raise ValueError(f"Unsupported file type: {path}")
+
+
+# ----------------------------
+# Build prompts for evaluation
+# ----------------------------
+SYSTEM = "You are a binary classifier. Answer ONLY “yes” or “no”."
+
+
+def make_eval_prompt(text: str) -> str:
+    return f"Text: {text}\nLabel (yes/no):"
+
+
+def normalize_yesno(s: str) -> str:
+    s = s.strip().lower()
+    # take first token-ish
+    s = s.split()[0] if s else ""
+    # common punctuation
+    s = s.strip(".,;:!\"'()[]{}")
+    if s.startswith("yes"):
+        return "yes"
+    if s.startswith("no"):
+        return "no"
+    return ""
+
+
+@torch.no_grad()
+def eval_accuracy(model, tokenizer, test_items, max_new_tokens=3, temperature=0.0, device="cuda", max_test=None):
+    model.eval()
+    n = 0
+    correct = 0
+
+    if max_test is not None:
+        test_items = test_items[:max_test]
+
+    for ex in test_items:
+        gold = ex["label"].strip().lower()
+
+        messages = [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": make_eval_prompt(ex["text"])},
+        ]
+
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+        gen = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0.0),
+            temperature=temperature if temperature > 0.0 else None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+        out = tokenizer.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        pred = normalize_yesno(out)
+
+        if pred == gold:
+            correct += 1
+        n += 1
+
+        if n % 200 == 0:
+            print(f"[eval] {n} done | acc so far = {correct/n:.4f}")
+
+    acc = correct / max(n, 1)
+    return acc
+
+
+# ----------------------------
+# Tokenization for SFT chat jsonl
+# Your train_ft.jsonl has: {"messages":[...]}
+# We train only on assistant tokens by masking labels.
+# ----------------------------
+def tokenize_chat_example(example, tokenizer, max_length: int):
+    messages = example["messages"]
+    # Build full chat text
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    enc = tokenizer(
+        text,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_tensors=None,
     )
+    input_ids = enc["input_ids"]
 
-class YesNoSFTDataset(Dataset):
-    """
-    Causal-LM fine-tuning:
-    input = prompt + answer
-    labels mask the prompt tokens (-100), so loss trains only on the answer tokens.
-    """
-    def __init__(self, examples, tokenizer, max_length=2048):
-        self.examples = examples
+    # Build labels but mask everything up to (and including) the last user message.
+    # Simplest robust approach: find the final assistant content string and only supervise that span.
+    # We'll locate the assistant content in the rendered text and mask earlier chars by retokenizing prefix.
+    # (Works well enough for this binary "yes/no" setup.)
+    last_assistant = None
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            last_assistant = m.get("content", "")
+            break
+
+    labels = [-100] * len(input_ids)
+
+    if last_assistant is not None and len(last_assistant.strip()) > 0:
+        # Try to find where assistant answer starts by rendering up to assistant message start
+        prefix_msgs = []
+        seen_assistant = False
+        for m in messages:
+            if m.get("role") == "assistant" and not seen_assistant:
+                seen_assistant = True
+                break
+            prefix_msgs.append(m)
+
+        prefix_text = tokenizer.apply_chat_template(prefix_msgs, tokenize=False, add_generation_prompt=True)
+        prefix_ids = tokenizer(prefix_text, truncation=True, max_length=max_length, padding=False)["input_ids"]
+
+        # The generation prompt ends right before assistant answer; supervise everything after that.
+        start = min(len(prefix_ids), len(input_ids))
+        for i in range(start, len(input_ids)):
+            labels[i] = input_ids[i]
+
+    return {"input_ids": input_ids, "attention_mask": enc["attention_mask"], "labels": labels}
+
+
+class PadCollator:
+    def __init__(self, tokenizer):
         self.tok = tokenizer
-        self.max_length = max_length
 
-    def __len__(self):
-        return len(self.examples)
+    def __call__(self, features):
+        # pad input_ids/attention_mask/labels to max length in batch
+        maxlen = max(len(f["input_ids"]) for f in features)
 
-    def __getitem__(self, idx):
-        ex = self.examples[idx]
-        prompt = build_prompt(ex["text"])
-        answer = ex["label"].strip().lower()
-        if answer not in {"yes", "no"}:
-            answer = "no"
+        def pad(seq, pad_id):
+            return seq + [pad_id] * (maxlen - len(seq))
 
-        # Add a leading space so tokenization is cleaner for many LMs.
-        full = prompt + " " + answer
-
-        tok_full = self.tok(
-            full,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=None,
-        )
-        tok_prompt = self.tok(
-            prompt,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=None,
-        )
-
-        input_ids = tok_full["input_ids"]
-        attention_mask = tok_full["attention_mask"]
-
-        # Mask prompt part
-        prompt_len = len(tok_prompt["input_ids"])
-        labels = [-100] * prompt_len + input_ids[prompt_len:]
-
-        # If truncation caused mismatch, align sizes
-        labels = labels[: len(input_ids)]
-        if len(labels) < len(input_ids):
-            labels += [-100] * (len(input_ids) - len(labels))
+        input_ids = [pad(f["input_ids"], self.tok.pad_token_id) for f in features]
+        attention_mask = [pad(f["attention_mask"], 0) for f in features]
+        labels = [pad(f["labels"], -100) for f in features]
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -81,153 +175,116 @@ class YesNoSFTDataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.long),
         }
 
-def collate_fn(batch):
-    # Pad to max length in batch
-    input_ids = [b["input_ids"] for b in batch]
-    attention_mask = [b["attention_mask"] for b in batch]
-    labels = [b["labels"] for b in batch]
-
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
-    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
-
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-@torch.inference_mode()
-def predict_yesno(model, tokenizer, examples, batch_size=8, max_new_tokens=3):
-    model.eval()
-    preds = []
-    for start in range(0, len(examples), batch_size):
-        batch = examples[start:start + batch_size]
-        prompts = [build_prompt(ex["text"]) for ex in batch]
-        inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        ).to(model.device)
-
-        gen = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-        # decode suffix
-        for i in range(gen.size(0)):
-            true_prompt_len = int(inputs["attention_mask"][i].sum().item())
-            suffix_ids = gen[i, true_prompt_len:]
-            suffix = tokenizer.decode(suffix_ids, skip_special_tokens=True).strip().lower()
-            # pick first yes/no occurrence
-            if "yes" in suffix and (suffix.find("yes") < suffix.find("no") or "no" not in suffix):
-                preds.append("yes")
-            elif "no" in suffix:
-                preds.append("no")
-            else:
-                preds.append("no")
-    return preds
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--train_path", default="trans_eq_data/train.json")
-    parser.add_argument("--valid_path", default="trans_eq_data/valid.json")
-    parser.add_argument("--test_path", default="trans_eq_data/test.json")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--train_path", default="trans_eq_data/train_ft.jsonl")
+    ap.add_argument("--valid_path", default="trans_eq_data/valid_ft.jsonl")
+    ap.add_argument("--test_path", default="trans_eq_data/test.json")
+    ap.add_argument("--output_dir", default="qwen_lora_run")
 
-    parser.add_argument("--output_dir", default="qwen_lora_out")
-    parser.add_argument("--max_length", type=int, default=2048)
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--train_bs", type=int, default=2)
-    parser.add_argument("--eval_bs", type=int, default=8)
-    parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--fp16", action="store_true")
+    ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--lr", type=float, default=2e-4)
 
-    # LoRA settings
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--train_bs", type=int, default=2)
+    ap.add_argument("--eval_bs", type=int, default=4)
+    ap.add_argument("--grad_accum", type=int, default=8)
 
-    args = parser.parse_args()
+    ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--max_train", type=int, default=None)
+    ap.add_argument("--max_valid", type=int, default=None)
+    ap.add_argument("--max_test", type=int, default=None)
 
-    train_data = load_json_list(args.train_path)
-    valid_data = load_json_list(args.valid_path)
-    test_data  = load_json_list(args.test_path)
+    args = ap.parse_args()
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # IMPORTANT: do NOT use 8bit/4bit. Avoid bitsandbytes completely.
+    dtype = torch.float16 if args.fp16 else None
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float16 if args.fp16 and torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        torch_dtype=dtype,
+        device_map="auto" if device == "cuda" else None,
     )
-    if not torch.cuda.is_available():
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        model.to(device)
 
-    # --- LoRA via PEFT ---
-    try:
-        from peft import LoraConfig, get_peft_model, TaskType
-    except ImportError as e:
-        raise SystemExit(
-            "peft is not installed. Install with: pip install peft\n"
-            "Also recommended: pip install accelerate\n"
-        ) from e
-
-    # Target modules: Qwen-style attention proj layers commonly include q_proj/k_proj/v_proj/o_proj
-    # Some variants use different names; PEFT will warn if not found.
-    lora_config = LoraConfig(
+    # LoRA config (Qwen-style proj names)
+    lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
         bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    train_ds = YesNoSFTDataset(train_data, tokenizer, max_length=args.max_length)
-    valid_ds = YesNoSFTDataset(valid_data, tokenizer, max_length=args.max_length)
+    # Load datasets
+    train_items = load_json_or_jsonl(args.train_path)
+    valid_items = load_json_or_jsonl(args.valid_path)
+    test_items = load_json_or_jsonl(args.test_path)
 
-    training_args = TrainingArguments(
+    if args.max_train is not None:
+        train_items = train_items[:args.max_train]
+    if args.max_valid is not None:
+        valid_items = valid_items[:args.max_valid]
+
+    train_ds = Dataset.from_list(train_items).map(lambda ex: tokenize_chat_example(ex, tokenizer, args.max_length))
+    valid_ds = Dataset.from_list(valid_items).map(lambda ex: tokenize_chat_example(ex, tokenizer, args.max_length))
+
+    collator = PadCollator(tokenizer)
+
+    # Training args: use eval_strategy (matches your BERT script style)
+    targs = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         per_device_train_batch_size=args.train_bs,
         per_device_eval_batch_size=args.eval_bs,
         gradient_accumulation_steps=args.grad_accum,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
         logging_steps=50,
-        fp16=bool(args.fp16 and torch.cuda.is_available()),
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        save_total_limit=2,
+        fp16=args.fp16 and device == "cuda",
         report_to="none",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        load_best_model_at_end=False,
     )
 
     trainer = Trainer(
         model=model,
-        args=training_args,
+        args=targs,
         train_dataset=train_ds,
         eval_dataset=valid_ds,
-        data_collator=collate_fn,
+        data_collator=collator,
+        tokenizer=tokenizer,
     )
 
     trainer.train()
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
-    # --- Evaluate on test set with generation accuracy ---
-    gold = [ex["label"] for ex in test_data]
-    preds = predict_yesno(model, tokenizer, test_data, batch_size=args.eval_bs)
-    acc = np.mean([p == g for p, g in zip(preds, gold)])
-    print(f"Qwen LoRA-finetuned accuracy on test set: {acc:.4f}")
+    # Evaluate accuracy on test.json (yes/no)
+    # Load the trained adapter model already in memory
+    acc = eval_accuracy(
+        model=model,
+        tokenizer=tokenizer,
+        test_items=test_items,
+        max_new_tokens=3,
+        temperature=0.0,
+        device=device,
+        max_test=args.max_test,
+    )
+    print(f"\nTEST ACCURACY = {acc:.6f}")
+
 
 if __name__ == "__main__":
     main()
